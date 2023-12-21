@@ -1,0 +1,17 @@
+[package]
+name = "print"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log="0.4.20"
+sanitize-filename = "0.5.0"
+env_logger = "0.10.1"
+futures = "0.3.29"
+uuid = { version = "1.6.1", features = ["v4","fast-rng","macro-diagnostics"] }
+
+ipp = { version = "5.0.2" }
+actix-web = "4"
+actix-multipart = "0.6"
