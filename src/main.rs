@@ -1,13 +1,13 @@
-use ipp;
-
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver, SendError, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
+use printers;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 use actix_multipart::Multipart;
@@ -15,8 +15,14 @@ use actix_web::error::InternalError;
 use actix_web::http::StatusCode;
 use actix_web::{web, App, Error, HttpResponse, HttpServer};
 
+static WORKER_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    static WORKER_ID: RefCell<usize> = RefCell::new(0);
+}
+
 trait Print {
-    fn print(&self) -> Result<(), std::io::Error>;
+    fn print(&self) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 trait Printable: Print + std::fmt::Debug {}
@@ -34,56 +40,91 @@ impl PrintJob {
 }
 
 impl Print for PrintJob {
-    fn print(&self) -> Result<(), std::io::Error> {
+    fn print(&self) -> Result<(), Box<dyn std::error::Error>> {
         println!("打印文件: {}", self.filepath);
         let mut file = std::fs::File::open(self.filepath.as_str())?;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)?;
 
-        println!("{:?}", contents);
+        // TODO: select printer from ui
+        let pdf_printer = printers::get_printer_by_name("Microsoft XPS Document Writer")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "打印机未找到"))?;
 
-        Ok(())
+        pdf_printer
+            .print(contents.as_slice(), None)
+            .map(|b| {
+                println!("打印结果: {:?}", b);
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e).into())
     }
 }
 
 #[derive(Debug)]
 struct PrintQueue {
-    queue: Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>,
-    sender: Sender<Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>>,
+    queue: Mutex<VecDeque<Box<dyn Printable + Send>>>,
+    notify: Notify,
+    terminate: AtomicBool,
 }
 
 impl PrintQueue {
-    fn new() -> PrintQueue {
-        let (sender, receiver): (
-            Sender<Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>>,
-            Receiver<Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>>,
-        ) = mpsc::channel();
+    fn new() -> Arc<Self> {
+        let pq = Arc::new(PrintQueue {
+            queue: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            terminate: AtomicBool::new(false),
+        });
+        let pq_clone = pq.clone();
 
-        let queue = Arc::new(Mutex::new(VecDeque::<Box<dyn Printable + Send>>::new()));
+        tokio::spawn(async move {
+            handle_print_jobs(pq_clone).await;
+        });
 
-        thread::spawn(move || handle_print_jobs(receiver));
-
-        PrintQueue { queue, sender }
+        pq
     }
 
-    fn add_job(
+    async fn add_job(
         &self,
         job: Box<dyn Printable + Send>,
-    ) -> Result<(), SendError<Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>>> {
-        let mut queue = self.queue.lock().unwrap();
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut queue = self.queue.lock().await;
         queue.push_back(job);
-        self.sender.send(self.queue.clone())
+        self.start();
+        Ok(())
+    }
+
+    fn start(&self) {
+        self.terminate.store(false, Ordering::Release);
+        self.notify.notify_one();
     }
 }
 
 // 处理打印任务
-fn handle_print_jobs(receiver: Receiver<Arc<Mutex<VecDeque<Box<dyn Printable + Send>>>>>) {
-    while let Ok(queue) = receiver.recv() {
-        let mut queue = queue.lock().unwrap();
+async fn handle_print_jobs(pq: Arc<PrintQueue>) {
+    let worker_id = WORKER_ID.with(|id| *id.borrow());
+    loop {
+        println!("---- 等待打印任务 {} ----", worker_id);
+        if pq.terminate.load(Ordering::Acquire) {
+            println!("---- 收到终止信号 {} ----", worker_id);
+            break; // 如果收到终止信号，退出循环
+        }
+
+        let mut queue = pq.queue.lock().await;
+
+        println!("---- 检查打印队列 {} ----", worker_id);
+        println!("---- 当前打印队列 {:?} ----\n", queue);
+
         if let Some(job) = queue.pop_front() {
+            drop(queue); // 释放锁，以便在打印时添加新任务
             match job.print() {
                 Ok(_) => println!("打印成功"),
                 Err(e) => println!("打印失败: {}", e),
+            }
+        } else {
+            drop(queue); // 在等待之前释放锁
+            pq.terminate.store(true, Ordering::Release);
+            pq.notify.notified().await;
+            if pq.terminate.load(Ordering::Acquire) {
+                break; // 再次检查终止信号，以防在等待时收到
             }
         }
     }
@@ -91,7 +132,7 @@ fn handle_print_jobs(receiver: Receiver<Arc<Mutex<VecDeque<Box<dyn Printable + S
 
 async fn upload_file(
     mut payload: Multipart,
-    print_queue: web::Data<PrintQueue>,
+    print_queue: web::Data<Arc<PrintQueue>>,
 ) -> Result<HttpResponse, Error> {
     while let Some(field) = payload.try_next().await? {
         // A multipart/form-data stream has to contain `content_disposition`
@@ -102,7 +143,10 @@ async fn upload_file(
         let filepath = format!("./tmp/{filename}");
 
         let saved_filepath = save_file(field, filepath).await?;
-        match print_queue.add_job(Box::new(PrintJob::new(saved_filepath))) {
+        match print_queue
+            .add_job(Box::new(PrintJob::new(saved_filepath)))
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 println!("打印任务添加失败: {}", e);
@@ -145,6 +189,10 @@ async fn main() -> std::io::Result<()> {
     log::info!("starting HTTP server at http://localhost:8080");
 
     HttpServer::new(move || {
+        WORKER_ID.with(|worker_id| {
+            *worker_id.borrow_mut() = WORKER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        });
+
         App::new()
             .app_data(web::Data::new(PrintQueue::new()))
             .route("/upload", web::post().to(upload_file))
